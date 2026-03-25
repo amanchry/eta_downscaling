@@ -6,98 +6,52 @@ A generalised framework to downscale WaPOR v3 Level 1 monthly Actual Evapotransp
 
 ## Methodology
 
-```
-╔══════════════════════════════════════════════════════════════════════╗
-║                        DATA ACQUISITION                             ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  ┌─────────────────┐    ┌──────────────────────┐    ┌─────────────┐ ║
-║  │  Coarse ETa     │    │  High-res Satellite   │    │ Fine-res    │ ║
-║  │  (300 m)        │    │  Imagery (30 m)       │    │ Reference   │ ║
-║  │  monthly        │    │  monthly composite    │    │ ETa (val.)  │ ║
-║  └────────┬────────┘    └──────────┬────────────┘    └──────┬──────┘ ║
-║           │                        │ Pre-processing          │       ║
-║           │                        │  · cloud / noise mask   │       ║
-║           │                        │  · radiometric scaling  │       ║
-║           │                        │  · temporal composite   │       ║
-║           │                        ▼                         │       ║
-║           │             ┌──────────────────────┐             │       ║
-║           │             │  Spectral / Thermal  │             │       ║
-║           │             │  Index Stack (30 m)  │             │       ║
-║           │             │  NDVI EVI SAVI       │             │       ║
-║           │             │  NDWI NDMI LST       │             │       ║
-║           │             └──────────────────────┘             │       ║
-╚═══════════╪════════════════════════╪════════════════════════╪════════╝
-            │                        │                         │
-            ▼                        ▼                         │
-╔══════════════════════════════════════════════════════╗        │
-║             TRAINING DATA PREPARATION                ║        │
-╠══════════════════════════════════════════════════════╣        │
-║                                                      ║        │
-║  Index stack (30 m)                                  ║        │
-║       │                                              ║        │
-║       │  Spatial aggregation → coarse grid           ║        │
-║       │  (mean resampling, align to ETa pixel grid)  ║        │
-║       ▼                                              ║        │
-║  ┌──────────────────┐  pair  ┌──────────────────┐    ║        │
-║  │  Indices @ 300 m │◄──────►│  Coarse ETa      │    ║        │
-║  │  NDVI EVI SAVI   │        │  300 m           │    ║        │
-║  │  NDWI NDMI LST   │        └──────────────────┘    ║        │
-║  └──────────────────┘                                ║        │
-║       │                                              ║        │
-║       ▼                                              ║        │
-║  Pixel-pair DataFrame (in memory)                    ║        │
-║  X: spectral / thermal indices                       ║        │
-║  y: ETa (mm / month)                                 ║        │
-╚══════════════════════╦═══════════════════════════════╝        │
-                       ║                                        │
-                       ▼                                        │
-╔══════════════════════════════════════════════════════╗        │
-║                  MODEL TRAINING                      ║        │
-╠══════════════════════════════════════════════════════╣        │
-║                                                      ║        │
-║  Train / test split (80 / 20, fixed random seed)     ║        │
-║  Feature normalisation where required by model       ║        │
-║                                                      ║        │
-║  ┌───────────────────────────────────────────────┐   ║        │
-║  │      Supervised Regression Model(s)           │   ║        │
-║  │   (any sklearn-compatible estimator)          │   ║        │
-║  └───────────────────────────────────────────────┘   ║        │
-║                                                      ║        │
-║  Evaluation: R²  RMSE  rRMSE  MAE  Bias              ║        │
-╚══════════════════════╦═══════════════════════════════╝        │
-                       ║                                        │
-                       ▼                                        │
-╔══════════════════════════════════════════════════════╗        │
-║              SPATIAL PREDICTION                      ║        │
-╠══════════════════════════════════════════════════════╣        │
-║                                                      ║        │
-║  Index stack (30 m)                                  ║        │
-║       │                                              ║        │
-║       │  model.predict()  pixel-by-pixel             ║        │
-║       ▼                                              ║        │
-║  Downscaled ETa map (30 m)                           ║        │
-║       │                                              ║        │
-║       │  Clip to study area boundary (AOI)           ║        │
-║       ▼                                              ║        │
-║  GeoTIFF  (CRS + transform preserved)                ║        │
-╚══════════════════════╦═══════════════════════════════╝        │
-                       ║                                        │
-                       ▼                                        ▼
-╔══════════════════════════════════════════════════════════════════════╗
-║                          VALIDATION                                  ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  Fine-resolution reference ETa  ──►  resample to target grid (30 m) ║
-║                                           │                          ║
-║                                           ▼                          ║
-║  Downscaled ETa (30 m)  vs  Reference ETa @ 30 m                    ║
-║                                                                      ║
-║  Spatial agreement metrics: R²   RMSE   MAE   Bias                  ║
-║                                                                      ║
-║  Note: reference is an independent model-based product.             ║
-║  Metrics reflect inter-product spatial agreement.                   ║
-╚══════════════════════════════════════════════════════════════════════╝
+```mermaid
+flowchart TD
+    %% ── Data Sources ──────────────────────────────────────────
+    A[(Coarse ETa\n300 m · monthly)]
+    B[/High-res Satellite\nImagery · 30 m/]
+    C[(Fine-res Reference\nETa · validation)]
+
+    %% ── Pre-processing ────────────────────────────────────────
+    B --> P["Pre-processing\n· cloud / noise masking\n· radiometric scaling\n· temporal composite"]
+    P --> I["Spectral / Thermal Index Stack · 30 m\nNDVI · EVI · SAVI · NDWI · NDMI · LST"]
+
+    %% ── Training data preparation ─────────────────────────────
+    subgraph TRAIN ["Training Data Preparation"]
+        I --> AGG["Spatial aggregation\n30 m → coarse grid\nmean resampling"]
+        AGG --> PAIR["Pixel-pair DataFrame\nX: spectral / thermal indices\ny: ETa  mm / month"]
+        A --> PAIR
+    end
+
+    %% ── Model training ────────────────────────────────────────
+    subgraph ML ["Model Training"]
+        PAIR --> SPLIT["Train / test split  80 / 20\nFeature normalisation"]
+        SPLIT --> MODEL["Supervised Regression Model\nany sklearn-compatible estimator"]
+        MODEL --> EVAL["Evaluation\nR²  RMSE  rRMSE  MAE  Bias"]
+    end
+
+    %% ── Spatial prediction ────────────────────────────────────
+    subgraph PRED ["Spatial Prediction"]
+        I --> PREDICT["model.predict\npixel-by-pixel · 30 m"]
+        MODEL --> PREDICT
+        PREDICT --> CLIP["Clip to study area boundary"]
+        CLIP --> TIFF[("Downscaled ETa GeoTIFF\n30 m · CRS preserved")]
+    end
+
+    %% ── Validation ────────────────────────────────────────────
+    subgraph VAL ["Validation"]
+        C --> RESAMP["Resample reference ETa\nto 30 m target grid"]
+        TIFF --> COMPARE["Compare pixel values\nDownscaled vs Reference"]
+        RESAMP --> COMPARE
+        COMPARE --> METRICS["Spatial agreement metrics\nR²  RMSE  MAE  Bias"]
+    end
+
+    %% ── Styles ────────────────────────────────────────────────
+    style TRAIN fill:#f0f4ff,stroke:#6b8cda
+    style ML    fill:#fff7e6,stroke:#d4a84b
+    style PRED  fill:#f0fff4,stroke:#4dab72
+    style VAL   fill:#fff0f0,stroke:#d46b6b
 ```
 
 ---
