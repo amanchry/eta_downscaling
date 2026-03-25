@@ -1,0 +1,4 @@
+Model,R² (vs L3),RMSE (mm/month),MAE (mm/month),Bias (mm/month),n_pixels
+Linear Regression,0.6601,16.878,10.4029,9.2619,124486
+Random Forest,0.6607,16.8651,10.0914,8.2545,124486
+XGBoost,0.6421,17.3206,10.6956,7.825,124486

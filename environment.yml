@@ -1,0 +1,31 @@
+name: condaml
+
+channels:
+  - conda-forge      # primary — best for GDAL, rasterio, geopandas
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.11
+
+  # Geospatial (install via conda-forge to avoid GDAL linking issues)
+  - gdal>=3.6
+  - rasterio>=1.3
+  - geopandas>=0.14
+
+  # Core scientific
+  - numpy>=1.24
+  - pandas>=2.0
+  - matplotlib>=3.7
+  - seaborn>=0.12
+  - joblib>=1.3
+
+  # ML (conda-forge builds)
+  - scikit-learn>=1.3
+  - xgboost>=2.0
+
+  # pip-only packages (GEE stack not on conda-forge)
+  - pip
+  - pip:
+    - earthengine-api>=0.1.380
+    - geemap>=0.30
