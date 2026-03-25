@@ -8,46 +8,50 @@ A generalised framework to downscale WaPOR v3 Level 1 monthly Actual Evapotransp
 
 ```mermaid
 flowchart TD
-    %% ── Data Sources ──────────────────────────────────────────
-    A[(Coarse ETa\n300 m · monthly)]
-    B[/High-res Satellite\nImagery · 30 m/]
-    C[(Fine-res Reference\nETa · validation)]
+    %% ── Input Data ────────────────────────────────────────────
+    subgraph SRC ["Input Data"]
+        direction LR
+        L8["Landsat 8 / 9\nCollection 2 L2 · 30 m\nGEE Python API"]
+        W1["WaPOR v3 L1\nAETI · 300 m · monthly\nFAO direct URL"]
+        W3["WaPOR v3 L3\nAETI · 20 m · monthly\nFAO direct URL"]
+    end
 
     %% ── Pre-processing ────────────────────────────────────────
-    B --> P["Pre-processing\n· cloud / noise masking\n· radiometric scaling\n· temporal composite"]
-    P --> I["Spectral / Thermal Index Stack · 30 m\nNDVI · EVI · SAVI · NDWI · NDMI · LST"]
+    L8 --> P["Pre-processing\n· cloud masking  QA_PIXEL\n· radiometric scaling\n· monthly median composite"]
+    P  --> I["Spectral / Thermal Index Stack · 30 m\nNDVI · EVI · SAVI · NDWI · NDMI · LST"]
 
     %% ── Training data preparation ─────────────────────────────
     subgraph TRAIN ["Training Data Preparation"]
-        I --> AGG["Spatial aggregation\n30 m → coarse grid\nmean resampling"]
-        AGG --> PAIR["Pixel-pair DataFrame\nX: spectral / thermal indices\ny: ETa  mm / month"]
-        A --> PAIR
+        I  --> AGG["Spatial aggregation\n30 m → 300 m  mean resampling\nalign to WaPOR L1 pixel grid"]
+        AGG --> PAIR["Pixel-pair DataFrame  in memory\nX: NDVI  EVI  SAVI  NDWI  NDMI  LST\ny: ETa  mm / month"]
+        W1 --> PAIR
     end
 
     %% ── Model training ────────────────────────────────────────
     subgraph ML ["Model Training"]
-        PAIR --> SPLIT["Train / test split  80 / 20\nFeature normalisation"]
-        SPLIT --> MODEL["Supervised Regression Model\nany sklearn-compatible estimator"]
+        PAIR  --> SPLIT["Train / test split  80 / 20\nFeature normalisation where required"]
+        SPLIT --> MODEL["Supervised Regression Model\nLinear Regression · Random Forest\nXGBoost · MLP"]
         MODEL --> EVAL["Evaluation\nR²  RMSE  rRMSE  MAE  Bias"]
     end
 
     %% ── Spatial prediction ────────────────────────────────────
     subgraph PRED ["Spatial Prediction"]
-        I --> PREDICT["model.predict\npixel-by-pixel · 30 m"]
+        I     --> PREDICT["model.predict\npixel-by-pixel · 30 m"]
         MODEL --> PREDICT
-        PREDICT --> CLIP["Clip to study area boundary"]
-        CLIP --> TIFF[("Downscaled ETa GeoTIFF\n30 m · CRS preserved")]
+        PREDICT --> CLIP["Clip to study area boundary  AOI"]
+        CLIP    --> TIFF[("Downscaled ETa GeoTIFF\n30 m · CRS preserved")]
     end
 
     %% ── Validation ────────────────────────────────────────────
     subgraph VAL ["Validation"]
-        C --> RESAMP["Resample reference ETa\nto 30 m target grid"]
-        TIFF --> COMPARE["Compare pixel values\nDownscaled vs Reference"]
+        W3   --> RESAMP["Bilinear resample\nWaPOR L3  20 m → 30 m"]
+        TIFF --> COMPARE["Pixel-wise comparison\nDownscaled vs WaPOR L3"]
         RESAMP --> COMPARE
         COMPARE --> METRICS["Spatial agreement metrics\nR²  RMSE  MAE  Bias"]
     end
 
     %% ── Styles ────────────────────────────────────────────────
+    style SRC   fill:#f5f5f5,stroke:#999999
     style TRAIN fill:#f0f4ff,stroke:#6b8cda
     style ML    fill:#fff7e6,stroke:#d4a84b
     style PRED  fill:#f0fff4,stroke:#4dab72
