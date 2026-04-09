@@ -12,7 +12,7 @@ def download_wapor_v3_L1_eta_data(
     geojson_obj,
 ):
     """
-    Download and clip WAPOR v3 L1 monthly ETa (300m, global) for a single month.
+    Download and clip WAPOR v3 L1 monthly ETa (300m, global) for a month.
 
     Parameters:
     - year  : int, e.g. 2018
@@ -90,7 +90,7 @@ def download_wapor_v3_L3_eta_data(
     region_id,
 ):
     """
-    Download and clip WAPOR v3 L3 monthly ETa (20m, regional) for a single month.
+    Download and clip WAPOR v3 L3 monthly ETa (20m, regional) for  month.
 
     Parameters:
     - year      : int, e.g. 2018

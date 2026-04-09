@@ -4,7 +4,6 @@ helpers/models.py
 All ML model training, evaluation, comparison, spatial prediction,
 and validation functions for the WaPOR ETa downscaling pipeline.
 
-Imported and called by ml_pipeline.py — do not run directly.
 """
 
 import os
@@ -22,9 +21,10 @@ from rasterio.warp import reproject as rasterio_reproject, Resampling
 from rasterio.mask import mask as rasterio_mask
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit, GroupKFold, cross_val_score
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import xgboost as xgb
 import joblib
@@ -46,7 +46,7 @@ TARGET_COL   = "ETa"
 NODATA_VALUE = -9999
 RANDOM_STATE = 42
 TEST_SIZE    = 0.2
-MONTH_LABEL  = "oct2023"   # suffix used in all output file names
+MONTH_LABEL  = ""   # set by main.py: _models.MONTH_LABEL = f"{YEAR}_{MONTH:02d}"
 
 # Models that require StandardScaler-normalised input
 SCALED_MODELS = {"Linear Regression", "MLP"}
@@ -54,6 +54,7 @@ SCALED_MODELS = {"Linear Regression", "MLP"}
 # Maps model display name → file stem used in output paths
 NAME_TO_FILE = {
     "Linear Regression": "LinearRegression",
+    "Decision Tree"     : "DecisionTree",
     "Random Forest"    : "RandomForest",
     "XGBoost"          : "XGBoost",
     "MLP"              : "MLP",
@@ -119,6 +120,42 @@ def save_model(model, name: str, out_dir: str) -> str:
     return path
 
 
+def visualize_spatial_split(df: pd.DataFrame, title: str, out_path: str) -> None:
+    """
+    Visualize the spatial distribution of training and testing samples.
+    
+    Parameters
+    ----------
+    df       : pd.DataFrame with 'x', 'y', and 'split' columns
+    title    : str
+    out_path : str
+    """
+    plt.figure(figsize=(10, 8))
+    
+    # Define colors for different splits
+    color_map = {
+        'Train'     : 'green',
+        'Test'      : 'red',
+        'Validation': 'orange',
+        'Sub-Train' : 'blue'
+    }
+    
+    for split_label, color in color_map.items():
+        subset = df[df['split'] == split_label]
+        if not subset.empty:
+            plt.scatter(subset['x'], subset['y'], c=color, label=split_label, s=15, alpha=0.6)
+            
+    plt.title(title, fontsize=14)
+    plt.xlabel('Longitude / X', fontsize=12)
+    plt.ylabel('Latitude / Y', fontsize=12)
+    plt.legend()
+    plt.grid(True, linestyle=':', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"  [saved] {out_path}")
+
+
 # =============================================================
 # STEP 1 — PREPROCESS TRAINING DATA
 # =============================================================
@@ -127,7 +164,7 @@ def preprocess_training_data(df: pd.DataFrame, out_dir: str = ".") -> tuple:
     """
     Clean the in-memory training DataFrame and return feature / target arrays.
 
-    Data arrives directly from extract_training_data() — no CSV is involved.
+    Data arrives directly from extract_training_data().
     Any remaining NaN or fill values (-9999) are dropped as a safety check.
 
     Parameters
@@ -243,11 +280,168 @@ def split_and_scale(X: pd.DataFrame, y: pd.Series) -> dict:
     }
 
 
+def add_spatial_blocks(df: pd.DataFrame, n_blocks_x: int = 10, n_blocks_y: int = 10) -> pd.DataFrame:
+    """
+    Divide the spatial extent of the data into a grid of blocks and assign
+    each pixel a block ID. Useful for spatially independent splitting.
+
+    Parameters
+    ----------
+    df         : pd.DataFrame with 'x' and 'y' columns
+    n_blocks_x : int  Number of divisions along X axis
+    n_blocks_y : int  Number of divisions along Y axis
+
+    Returns
+    -------
+    pd.DataFrame with a new 'block_id' column
+    """
+    x_min, x_max = df['x'].min(), df['x'].max()
+    y_min, y_max = df['y'].min(), df['y'].max()
+
+    # Avoid division by zero if all points are on a line
+    x_range = (x_max - x_min) if x_max > x_min else 1.0
+    y_range = (y_max - y_min) if y_max > y_min else 1.0
+
+    x_bins = np.linspace(x_min, x_max, n_blocks_x + 1)
+    y_bins = np.linspace(y_min, y_max, n_blocks_y + 1)
+
+    # Assign each point to a grid cell
+    df['x_bin'] = np.digitize(df['x'], x_bins) - 1
+    df['y_bin'] = np.digitize(df['y'], y_bins) - 1
+    
+    # Clip indices to [0, n_blocks-1]
+    df['x_bin'] = df['x_bin'].clip(0, n_blocks_x - 1)
+    df['y_bin'] = df['y_bin'].clip(0, n_blocks_y - 1)
+
+    # Create a unique block ID
+    df['block_id'] = df['x_bin'] * n_blocks_y + df['y_bin']
+    
+    n_actual = df['block_id'].nunique()
+    print(f"  Spatial Partitioning: {n_blocks_x}x{n_blocks_y} grid created ({n_actual} occupied blocks)")
+    return df
+
+
+def split_and_scale_spatial(df: pd.DataFrame, test_size: float = 0.2, 
+                            n_blocks_x: int = 10, n_blocks_y: int = 10) -> dict:
+    """
+    Perform a spatially independent split by dividing the study area into blocks
+    and assigning all pixels in a block to either training or testing.
+
+    Parameters
+    ----------
+    df : pd.DataFrame  Must contain FEATURE_COLS + [TARGET_COL, 'x', 'y']
+    test_size  : float
+    n_blocks_x : int
+    n_blocks_y : int
+
+    Returns
+    -------
+    dict (same structure as split_and_scale)
+    """
+    print_section("STEP 2 (Spatial) — Spatial Block Partitioning & Splitting")
+    
+    # 1. Assign blocks
+    df = add_spatial_blocks(df.copy(), n_blocks_x, n_blocks_y)
+    
+    # 2. Split by block_id
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=RANDOM_STATE)
+    train_idx, test_idx = next(gss.split(df[FEATURE_COLS], df[TARGET_COL], groups=df['block_id']))
+    
+    train_df = df.iloc[train_idx]
+    test_df  = df.iloc[test_idx]
+    
+    X_train_raw = train_df[FEATURE_COLS].values
+    X_test_raw  = test_df[FEATURE_COLS].values
+    y_train     = train_df[TARGET_COL].values
+    y_test      = test_df[TARGET_COL].values
+    
+    print(f"  Train Blocks : {train_df['block_id'].nunique()} blocks ({len(train_df)} samples)")
+    print(f"  Test Blocks  : {test_df['block_id'].nunique()} blocks ({len(test_df)} samples)")
+    
+    # 3. Scale SCALED_MODELS
+    scaler      = StandardScaler()
+    X_train_sc  = scaler.fit_transform(X_train_raw)
+    X_test_sc   = scaler.transform(X_test_raw)
+
+    return {
+        "X_train_raw": X_train_raw,
+        "X_test_raw" : X_test_raw,
+        "X_train_sc" : X_train_sc,
+        "X_test_sc"  : X_test_sc,
+        "y_train"    : y_train,
+        "y_test"     : y_test,
+        "scaler"     : scaler,
+        "groups_train": train_df['block_id'].values # useful for spatial CV
+    }
+
+
+def split_and_scale_spatial_multilevel(df: pd.DataFrame, 
+                                       outer_test_size: float = 0.2,
+                                       inner_val_size: float = 0.25,
+                                       n_blocks_x: int = 10, 
+                                       n_blocks_y: int = 10,
+                                       seed: int = RANDOM_STATE) -> dict:
+    """
+    Perform a multi-level spatially independent split:
+    1. Outer Split: 80% Train/Pool, 20% Final Test (block-based).
+    2. Inner Split: 80% Pool -> 75% Sub-Train, 25% Val (block-based).
+    """
+    # 1. Assign blocks
+    df = add_spatial_blocks(df.copy(), n_blocks_x, n_blocks_y)
+    
+    # 2. Outer Split: Pool vs Test
+    gss_outer = GroupShuffleSplit(n_splits=1, test_size=outer_test_size, random_state=seed)
+    train_pool_idx, test_idx = next(gss_outer.split(df[FEATURE_COLS], df[TARGET_COL], groups=df['block_id']))
+    
+    train_pool_df = df.iloc[train_pool_idx]
+    test_df       = df.iloc[test_idx]
+    
+    # 3. Inner Split: Sub-Train vs Val
+    gss_inner = GroupShuffleSplit(n_splits=1, test_size=inner_val_size, random_state=seed + 1)
+    subtrain_idx, val_idx = next(gss_inner.split(train_pool_df[FEATURE_COLS], train_pool_df[TARGET_COL], groups=train_pool_df['block_id']))
+    
+    subtrain_df = train_pool_df.iloc[subtrain_idx]
+    val_df      = train_pool_df.iloc[val_idx]
+    
+    print(f"  Hierarchy:")
+    print(f"  ├── Train Pool   : {train_pool_df['block_id'].nunique()} blocks")
+    print(f"  │   ├── Sub-Train: {subtrain_df['block_id'].nunique()} blocks ({len(subtrain_df)} px)")
+    print(f"  │   └── Val (OOB): {val_df['block_id'].nunique()} blocks ({len(val_df)} px)")
+    # 4. Label the DataFrame for visualization
+    df['split'] = 'Other'
+    df.iloc[test_idx, df.columns.get_loc('split')] = 'Test'
+    df.loc[subtrain_df.index, 'split'] = 'Sub-Train'
+    df.loc[val_df.index, 'split'] = 'Validation'
+
+    # 5. Format outputs for trainers
+    X_train_raw = subtrain_df[FEATURE_COLS].values
+    X_test_raw  = test_df[FEATURE_COLS].values
+    X_val_raw   = val_df[FEATURE_COLS].values
+    y_train     = subtrain_df[TARGET_COL].values
+    y_test      = test_df[TARGET_COL].values
+    y_val       = val_df[TARGET_COL].values
+
+    # Fit scaler on sub-training split
+    scaler      = StandardScaler()
+    X_train_sc  = scaler.fit_transform(X_train_raw)
+    X_test_sc   = scaler.transform(X_test_raw)
+    X_val_sc    = scaler.transform(X_val_raw)
+
+    return {
+        "X_train_raw": X_train_raw, "X_test_raw": X_test_raw, "X_val_raw": X_val_raw,
+        "X_train_sc" : X_train_sc,  "X_test_sc" : X_test_sc,  "X_val_sc"  : X_val_sc,
+        "y_train"    : y_train,     "y_test"    : y_test,     "y_val"     : y_val,
+        "scaler"     : scaler,
+        "groups_train": train_pool_df['block_id'].values,
+        "vis_df"     : df # Labeled DataFrame for visualization
+    }
+
+
 # =============================================================
 # STEP 3 — MODEL TRAINING
 # =============================================================
 
-def train_linear_regression(data: dict, out_dir: str) -> dict:
+def train_linear_regression(data: dict, out_dir: str, seed: int = RANDOM_STATE) -> dict:
     """
     Train an Ordinary Least Squares Linear Regression baseline.
 
@@ -298,7 +492,65 @@ def train_linear_regression(data: dict, out_dir: str) -> dict:
             "train_time": train_time, "y_pred_test": y_pred}
 
 
-def train_random_forest(data: dict, out_dir: str) -> dict:
+def train_decision_tree(data: dict, out_dir: str, seed: int = RANDOM_STATE) -> dict:
+    """
+    Train a single CART Decision Tree regressor.
+
+    Notes
+    -----
+    - A single tree is a useful interpretable baseline, but it can overfit.
+    - Tree models are scale-invariant, so we use raw (unscaled) features.
+    """
+    print_section("STEP 3b — Decision Tree (Baseline Tree)")
+
+    # Conservative defaults to reduce overfitting on pixel-wise datasets.
+    model = DecisionTreeRegressor(
+        max_depth=12,
+        min_samples_split=10,
+        min_samples_leaf=5,
+        random_state=seed,
+    )
+
+    t0 = time.time()
+    try:
+        model.fit(data["X_train_raw"], data["y_train"])
+    except Exception as e:
+        print(f"[ERROR] DecisionTree failed: {e}")
+        traceback.print_exc()
+        return {}
+    train_time = time.time() - t0
+
+    y_pred = model.predict(data["X_test_raw"])
+    metrics = compute_metrics(data["y_test"], y_pred)
+
+    print(f"  Train time : {train_time:.2f} s")
+    print(f"  R²         : {metrics['R2']:.4f}")
+    print(f"  RMSE       : {metrics['RMSE']:.4f} mm/month")
+    print(f"  rRMSE      : {metrics['rRMSE_pct']:.2f} %")
+
+    # Feature importances (impurity-based); helps interpret the single tree.
+    imp_df = (pd.DataFrame({"Feature": FEATURE_COLS,
+                             "Importance": model.feature_importances_.round(6)})
+                .sort_values("Importance", ascending=False))
+    print("\n  Feature Importances (mean impurity decrease):")
+    print(imp_df.to_string(index=False))
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.barh(imp_df["Feature"], imp_df["Importance"], color="slateblue")
+    ax.set_xlabel("Importance (mean impurity decrease)")
+    ax.set_title("Decision Tree — Feature Importances")
+    fig.tight_layout()
+    dt_imp_path = os.path.join(out_dir, "dt_importances.png")
+    plt.savefig(dt_imp_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [saved] {dt_imp_path}")
+
+    return {"model": model, "metrics": metrics,
+            "name": "Decision Tree",
+            "train_time": train_time, "y_pred_test": y_pred}
+
+
+def train_random_forest(data: dict, out_dir: str, seed: int = RANDOM_STATE) -> dict:
     """
     Train a Random Forest ensemble regressor.
 
@@ -314,7 +566,7 @@ def train_random_forest(data: dict, out_dir: str) -> dict:
     -------
     dict  keys: model, metrics, name, train_time, y_pred_test
     """
-    print_section("STEP 3b — Random Forest")
+    print_section("STEP 3c — Random Forest")
 
     model = RandomForestRegressor(
         n_estimators    =200,
@@ -323,7 +575,7 @@ def train_random_forest(data: dict, out_dir: str) -> dict:
         min_samples_leaf =2,
         max_features    ="sqrt",    # sqrt(n_features) per split
         n_jobs          =-1,        # parallelise across all cores
-        random_state    =RANDOM_STATE,
+        random_state    =seed,
     )
     t0 = time.time()
     try:
@@ -353,21 +605,60 @@ def train_random_forest(data: dict, out_dir: str) -> dict:
     ax.barh(imp_df["Feature"], imp_df["Importance"], color="steelblue")
     ax.set_xlabel("Importance (mean impurity decrease)")
     ax.set_title("Random Forest — Feature Importances")
-    ax.invert_yaxis()
     fig.tight_layout()
-    rf_imp_path = os.path.join(out_dir, "rf_feature_importance.png")
-    plt.savefig(rf_imp_path, bbox_inches="tight")
+    plt.savefig(os.path.join(out_dir, "rf_importances.png"))
     plt.close(fig)
-    print(f"  [saved] {rf_imp_path}")
-
-    # save_model(model, "RandomForest", out_dir)
 
     return {"model": model, "metrics": metrics,
             "name": "Random Forest",
             "train_time": train_time, "y_pred_test": y_pred}
 
 
-def train_xgboost(data: dict, out_dir: str) -> dict:
+def tune_random_forest_spatial(data: dict, mtry_values: list = [1, 2, 3, 4, 5, 6]) -> int:
+    """
+    Find the best 'max_features' (mtry) using Spatial Cross-Validation.
+    This ensures that the hyperparameters are tuned on a spatially 
+    independent validation set, rather than random OOB samples.
+
+    Parameters
+    ----------
+    data        : dict  Output of split_and_scale_spatial()
+    mtry_values : list  Candidate values for max_features
+
+    Returns
+    -------
+    int  The mtry value with the highest R2 (or lowest MSE)
+    """
+    print_section("Hyperparameter Tuning — Spatial Cross-Validation")
+    
+    X      = data["X_train_raw"]
+    y      = data["y_train"]
+    groups = data["groups_train"]
+    
+    # Use 5-fold Spatial CV
+    gkf    = GroupKFold(n_splits=5)
+    
+    results = []
+    for mtry in mtry_values:
+        model = RandomForestRegressor(
+            n_estimators = 200, 
+            max_features = mtry, 
+            n_jobs       =-1, 
+            random_state = RANDOM_STATE
+        )
+        
+        # Cross-validation scores (neg_mean_squared_error)
+        scores = cross_val_score(model, X, y, groups=groups, cv=gkf, scoring='neg_mean_squared_error')
+        mse    = -scores.mean()
+        results.append({'mtry': mtry, 'mse': mse})
+        print(f"  mtry={mtry} | Spatial CV MSE: {mse:.6f}")
+
+    best_mtry = min(results, key=lambda x: x['mse'])['mtry']
+    print(f"\n  Optimal mtry found: {best_mtry}")
+    return best_mtry
+
+
+def train_xgboost(data: dict, out_dir: str, seed: int = RANDOM_STATE) -> dict:
     """
     Train an XGBoost gradient-boosted tree regressor.
 
@@ -384,7 +675,7 @@ def train_xgboost(data: dict, out_dir: str) -> dict:
     -------
     dict  keys: model, metrics, name, train_time, y_pred_test
     """
-    print_section("STEP 3c — XGBoost")
+    print_section("STEP 3d — XGBoost")
 
     model = xgb.XGBRegressor(
         n_estimators    =200,
@@ -392,7 +683,7 @@ def train_xgboost(data: dict, out_dir: str) -> dict:
         learning_rate   =0.05,
         subsample       =0.8,
         colsample_bytree=0.8,
-        random_state    =RANDOM_STATE,
+        random_state    =seed,
         n_jobs          =-1,
         verbosity       =0,
     )
@@ -443,7 +734,7 @@ def train_xgboost(data: dict, out_dir: str) -> dict:
             "train_time": train_time, "y_pred_test": y_pred}
 
 
-def train_mlp(data: dict, out_dir: str) -> dict:
+def train_mlp(data: dict, out_dir: str, seed: int = RANDOM_STATE) -> dict:
     """
     Train a Multi-Layer Perceptron (MLP) neural network regressor.
 
@@ -461,7 +752,7 @@ def train_mlp(data: dict, out_dir: str) -> dict:
     -------
     dict  keys: model, metrics, name, train_time, y_pred_test
     """
-    print_section("STEP 3d — MLP Neural Network")
+    print_section("STEP 3e — MLP Neural Network")
 
     model = MLPRegressor(
         hidden_layer_sizes =(128, 64),
@@ -472,7 +763,7 @@ def train_mlp(data: dict, out_dir: str) -> dict:
         early_stopping     =True,
         validation_fraction=0.1,
         n_iter_no_change   =20,
-        random_state       =RANDOM_STATE,
+        random_state       =seed,
     )
     t0 = time.time()
     try:
@@ -543,15 +834,19 @@ def compare_models(results: list, data: dict, out_dir: str) -> str:
     print(f"  [saved] {csv_out}")
 
     # Grouped bar chart — R², RMSE, rRMSE
-    colors      = ["steelblue", "darkorange", "seagreen", "crimson"]
+    # Use a repeatable palette that scales to any number of models.
+    colors = list(plt.cm.tab10.colors)
     model_names = summary_df["Model"].tolist()
     fig, axes   = plt.subplots(1, 3, figsize=(14, 4))
 
     for ax, (col, label) in zip(axes, [("R²", "R²"),
                                         ("RMSE (mm/month)", "RMSE"),
                                         ("rRMSE (%)", "rRMSE (%)")]):
-        bars = ax.bar(model_names, summary_df[col],
-                      color=colors[:len(model_names)])
+        bars = ax.bar(
+            model_names,
+            summary_df[col],
+            color=[colors[i % len(colors)] for i in range(len(model_names))],
+        )
         ax.set_title(label)
         ax.set_ylabel(label)
         ax.set_xticklabels(model_names, rotation=20, ha="right")
@@ -614,6 +909,105 @@ def compare_models(results: list, data: dict, out_dir: str) -> str:
     return best_name
 
 
+def run_stability_analysis(trainer_func, df_raw: pd.DataFrame, out_dir: str, 
+                           n_iterations: int = 100, split_type: str = 'random') -> list:
+    """
+    Run a model training function multiple times with different data splits 
+    to assess performance stability (Monte Carlo Cross-Validation).
+    """
+    results = []
+    # Explicitly print the type so the user can verify
+    print_section(f"STABILITY TEST: {split_type.upper()} MODE")
+    
+    for i in range(n_iterations):
+        current_seed = i + 42
+        
+        # 1. Perform a fresh split in each iteration
+        if split_type == 'spatial_multilevel':
+            # ── SPATIAL BLOCK SHUFFLE ──
+            iter_data = split_and_scale_spatial_multilevel(df_raw, seed=current_seed)
+        else:
+            # ── RANDOM PIXEL SHUFFLE ──
+            from sklearn.model_selection import train_test_split
+            from sklearn.preprocessing import StandardScaler
+            
+            # Explicitly select only the columns we need for ML
+            X_cols = df_raw[FEATURE_COLS].values
+            y_cols = df_raw[TARGET_COL].values
+            
+            X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+                X_cols, y_cols, test_size=0.2, random_state=current_seed, shuffle=True
+            )
+            
+            scaler = StandardScaler()
+            X_train_sc = scaler.fit_transform(X_train_raw)
+            X_test_sc  = scaler.transform(X_test_raw)
+            
+            iter_data = {
+                "X_train_raw": X_train_raw, "X_test_raw": X_test_raw,
+                "X_train_sc" : X_train_sc,  "X_test_sc" : X_test_sc,
+                "y_train"    : y_train,     "y_test"    : y_test,
+                "scaler"     : scaler
+            }
+        
+        # 2. Train the model
+        res = trainer_func(iter_data, out_dir, seed=current_seed)
+        
+        if res:
+            m = res['metrics'].copy()
+            m['Model'] = res['name']
+            m['Iteration'] = i
+            results.append(m)
+            
+        if (i + 1) % 25 == 0:
+            print(f"    [{split_type.upper()}] Progress: {i + 1} / {n_iterations}...")
+            
+    return results
+
+
+def plot_stability_distributions(all_metric_results: list, out_dir: str) -> None:
+    """
+    Generate boxplots to visualize the distribution of R2 and RMSE across iterations.
+    
+    Parameters
+    ----------
+    all_metric_results : list of dicts  Combined metrics from all models/iterations
+    out_dir            : str            Output directory
+    """
+    df = pd.DataFrame(all_metric_results)
+    
+    # Check if we have multiple models
+    if df['Model'].nunique() < 1:
+        return
+
+    print_section("Generating Stability Plots")
+    
+    # 1. R2 Distribution
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x='Model', y='R2', data=df, palette='Set2')
+    plt.title(f"Performance Stability: R² Distribution ({len(df)//df['Model'].nunique()} iterations)")
+    plt.ylabel("R² (Test Set)")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    r2_dist_path = os.path.join(out_dir, "stability_r2_distribution.png")
+    plt.savefig(r2_dist_path)
+    plt.close()
+    
+    # 2. RMSE Distribution
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x='Model', y='RMSE', data=df, palette='Set3')
+    plt.title(f"Performance Stability: RMSE Distribution ({len(df)//df['Model'].nunique()} iterations)")
+    plt.ylabel("RMSE (mm/month)")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    rmse_dist_path = os.path.join(out_dir, "stability_rmse_distribution.png")
+    plt.savefig(rmse_dist_path)
+    plt.close()
+    
+    print(f"  [saved] {r2_dist_path}")
+    print(f"  [saved] {rmse_dist_path}")
+
+
 # =============================================================
 # STEP 5 — APPLY MODELS TO 30 m RASTER
 # =============================================================
@@ -627,7 +1021,7 @@ def predict_raster(
     aoi_path: str = None,
 ) -> None:
     """
-    Apply every trained model to the 30 m Landsat index stack and
+    Apply trained model to the 30 m Landsat index stack and
     write one downscaled ETa GeoTIFF per model.
 
     Only valid pixels (all 6 bands finite and not NoData) are passed

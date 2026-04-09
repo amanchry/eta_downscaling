@@ -1,7 +1,5 @@
 """
-ml_pipeline.py
-==============
-Full end-to-end pipeline for WaPOR ETa downscaling.
+Full end-to-end pipeline for WaPOR v3 ETa downscaling.
 
 Steps
 -----
@@ -20,15 +18,13 @@ Steps
   8.  Compare models — metrics table + bar chart + scatter plots
   9.  Apply all models to 30 m raster → downscaled ETa GeoTIFFs
   10. Validate downscaled maps against WaPOR L3
-
-Run:
-    python ml_pipeline.py
 """
 
 import os
 from pathlib import Path
 
 import geopandas as gpd
+import pandas as pd
 
 # ── Download helpers ──────────────────────────────────────────
 from helpers.ETa_wapor_v3_download import (
@@ -44,6 +40,8 @@ from helpers.models import (
     print_section,
     preprocess_training_data,
     split_and_scale,
+    split_and_scale_spatial_multilevel,
+    train_decision_tree,
     train_linear_regression,
     train_random_forest,  
     train_xgboost,        
@@ -51,6 +49,9 @@ from helpers.models import (
     compare_models,
     predict_raster,
     validate_against_l3,
+    run_stability_analysis,
+    plot_stability_distributions,
+    visualize_spatial_split,
 )
 
 
@@ -61,16 +62,19 @@ from helpers.models import (
 YEAR            = 2018
 MONTH           = 10
 
-AOI_GEOJSON     = Path("Mwea_Scheme.geojson")  # study area boundary
-AOI_BUFFER_M    = 0                             # buffer around AOI in metres
-WAPOR_L3_REGION = "KMW"                         # WaPOR L3 region code for Mwea
-MAX_CLOUD       = 5                             # max cloud cover % per Landsat image
+AOI_GEOJSON        = Path("Mwea_Scheme.geojson")  # study area boundary
+AOI_BUFFER_M       = 0                             # buffer around AOI in metres
+STABILITY_TEST     = False                          # Run 100 iterations for spread analysis
+USE_SPATIAL_SPLIT  = True                         # Set to True for Multi-level Spatial Split
+N_ITERATIONS       = 100
+WAPOR_L3_REGION    = "KMW"                         # WaPOR L3 region code for Mwea
+MAX_CLOUD          = 5                             # max cloud cover % per Landsat image
 
 INPUT_FOLDER    = Path("input_data")            # downloaded rasters
 OUTPUT_FOLDER   = Path("output_data_10m")       # models, GeoTIFFs, figures
 
 # =============================================================
-# Derived paths — do not edit
+# Derived paths 
 # =============================================================
 
 _TAG = f"{YEAR}_{MONTH:02d}"
@@ -134,13 +138,13 @@ def _aoi_geojson_dict(aoi_gdf: gpd.GeoDataFrame) -> dict:
 
 def main() -> None:
     """
-    Run all pipeline steps end-to-end.
-    Training data is kept in memory — no intermediate CSV is written.
+    Run all steps end-to-end.
+    Training data is kept in memory.
     Edit the CONFIGURATION block above to change study area or period.
     """
     print("=" * 60)
     print("  WaPOR ETa Downscaling — Full End-to-End Pipeline")
-    print(f"  Study area : Mwea Irrigation Scheme, Kenya")
+    print(f"  Study area : {AOI_GEOJSON}")
     print(f"  Period     : {YEAR}-{MONTH:02d}")
     print("=" * 60)
 
@@ -171,7 +175,7 @@ def main() -> None:
     print(f"  L1 AETI : {WAPOR_L1_PATH}")
 
     # ----------------------------------------------------------
-    # Step 2 — Download WaPOR L3 AETI (20 m) — validation only
+    # Step 2 — Download WaPOR L3 AETI (20 m) — for validation
     # ----------------------------------------------------------
     print_section("STEP 2 — Download WaPOR L3 AETI (20 m)")
     if WAPOR_L3_PATH.exists():
@@ -205,15 +209,16 @@ def main() -> None:
     print(f"  Landsat : {LANDSAT_PATH}")
 
     # ----------------------------------------------------------
-    # Step 4 — Extract training data in memory
+    # Step 4 — Extract training data
     #   Aggregates Landsat 30 m → 300 m (mean), aligns to WaPOR
-    #   L1 pixel grid, returns a DataFrame — no CSV written.
+    #   L1 pixel grid, returns a DataFrame.
     # ----------------------------------------------------------
     print_section("STEP 4 — Extract Training Data (in memory)")
     df_raw = extract_training_data(
         landsat_indices_path =str(LANDSAT_PATH),
         wapor_l1_path        =str(WAPOR_L1_PATH),
     )
+    # df_raw.to_csv("training_data_pixel.csv")
 
     # ----------------------------------------------------------
     # Step 5 — Preprocess: clean + print stats + correlation plot
@@ -223,22 +228,95 @@ def main() -> None:
     # ----------------------------------------------------------
     # Step 6 — Train/test split and feature scaling
     # ----------------------------------------------------------
-    data = split_and_scale(X, y)
+    if USE_SPATIAL_SPLIT:
+        data = split_and_scale_spatial_multilevel(df_raw, seed=42)
+        
+        # ── Step 6.1 — Visualize the Split ────────────────
+        print_section("STEP 6.1 — Visualize Current Spatial Split")
+        split_map_path = os.path.join(str(OUTPUT_FOLDER), "spatial_split_visualization.png")
+        visualize_spatial_split(
+            data['vis_df'], 
+            f"Multi-level Spatial Split (Seed 42)", 
+            split_map_path
+        )
+    else:
+        # Standard random split
+        data = split_and_scale(X, y)
+        
+        # ── Step 6.1 — Visualize the Random Split ────────
+        print_section("STEP 6.1 — Visualize Current Random Split")
+        # We create a visualization dataframe for the random split
+        vis_df_random = df_raw.copy()
+        # Initialise with 'Test'
+        vis_df_random['split'] = 'Test'
+        
+        # We need to map the training indices back. 
+        # Note: data['X_train_raw'] matches the first 80% if shuffle=False, 
+        # but since we use shuffle=True, we'll just show the distribution 
+        # by recreating the mask with the same seed.
+        from sklearn.model_selection import train_test_split
+        train_idx, _ = train_test_split(df_raw.index, test_size=0.2, random_state=42, shuffle=True)
+        vis_df_random.loc[train_idx, 'split'] = 'Train'
+        
+        split_map_path = os.path.join(str(OUTPUT_FOLDER), "spatial_split_visualization.png")
+        visualize_spatial_split(
+            vis_df_random, 
+            "Random Pixel-wise Split (80/20)", 
+            split_map_path
+        )
 
     # ----------------------------------------------------------
-    # Step 7 — Train model
-    #   Currently: Linear Regression only (baseline).
-    #   To add more models later, uncomment the other lines and
-    #   add them to all_results.
+    # Step 7 — Train & Stability Analysis
     # ----------------------------------------------------------
-    lr_result = train_linear_regression(data, str(OUTPUT_FOLDER))
+    if STABILITY_TEST:
+        print_section(f"STEP 7 — Stability Analysis ({N_ITERATIONS} iterations)")
+        
+        # 1. Run stability tests (re-splitting in each iteration)
+        split_type = 'spatial_multilevel' if USE_SPATIAL_SPLIT else 'random'
+        
+        lr_stability  = run_stability_analysis(train_linear_regression, df_raw, str(OUTPUT_FOLDER), N_ITERATIONS, split_type=split_type)
+        dt_stability  = run_stability_analysis(train_decision_tree, df_raw, str(OUTPUT_FOLDER), N_ITERATIONS, split_type=split_type)
+        rf_stability  = run_stability_analysis(train_random_forest, df_raw, str(OUTPUT_FOLDER), N_ITERATIONS, split_type=split_type)
+        xgb_stability = run_stability_analysis(train_xgboost, df_raw, str(OUTPUT_FOLDER), N_ITERATIONS, split_type=split_type)
+        mlp_stability = run_stability_analysis(train_mlp, df_raw, str(OUTPUT_FOLDER), N_ITERATIONS, split_type=split_type)
+        
+        # 2. Combine results and plot distributions
+        all_stability_results = lr_stability + dt_stability + rf_stability + xgb_stability + mlp_stability
+        plot_stability_distributions(all_stability_results, str(OUTPUT_FOLDER))
+        
+        # 3. Calculate Mean Metrics for final comparison (to show in bar chart)
+        def get_mean_metrics(stability_list):
+            df_s = pd.DataFrame(stability_list)
+            return {
+                "R2": df_s['R2'].mean(),
+                "RMSE": df_s['RMSE'].mean(),
+                "rRMSE_pct": df_s['rRMSE_pct'].mean(),
+                "MAE": df_s['MAE'].mean(),
+                "Bias": df_s['Bias'].mean()
+            }
+        
+        # 4. Train one final set of models for the prediction step
+        lr_result  = train_linear_regression(data, str(OUTPUT_FOLDER))
+        dt_result  = train_decision_tree(data, str(OUTPUT_FOLDER))
+        rf_result  = train_random_forest(data, str(OUTPUT_FOLDER))
+        xgb_result = train_xgboost(data, str(OUTPUT_FOLDER))
+        mlp_result = train_mlp(data, str(OUTPUT_FOLDER))
+        
+        # 5. OVERRIDE the single-run metrics with the 100-run AVERAGE
+        lr_result['metrics']  = get_mean_metrics(lr_stability)
+        dt_result['metrics']  = get_mean_metrics(dt_stability)
+        rf_result['metrics']  = get_mean_metrics(rf_stability)
+        xgb_result['metrics'] = get_mean_metrics(xgb_stability)
+        mlp_result['metrics'] = get_mean_metrics(mlp_stability)
+        
+    else:
+        lr_result  = train_linear_regression(data, str(OUTPUT_FOLDER))
+        dt_result  = train_decision_tree(data, str(OUTPUT_FOLDER))
+        rf_result  = train_random_forest(data, str(OUTPUT_FOLDER))
+        xgb_result = train_xgboost(data, str(OUTPUT_FOLDER))
+        mlp_result = train_mlp(data, str(OUTPUT_FOLDER))
 
-    rf_result  = train_random_forest(data, str(OUTPUT_FOLDER))
-    xgb_result = train_xgboost(data, str(OUTPUT_FOLDER))
-    # mlp_result = train_mlp(data, str(OUTPUT_FOLDER))
-
-    all_results = [lr_result,rf_result,xgb_result]
-    # all_results = [lr_result, rf_result, xgb_result, mlp_result]
+    all_results = [lr_result, dt_result, rf_result, xgb_result, mlp_result]
 
     # ----------------------------------------------------------
     # Step 8 — Evaluate model

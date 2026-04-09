@@ -27,6 +27,8 @@ venv/
 helpers/*service-account*.json
 helpers/*.json
 
+README_local.md
+
 # GDAL / rasterio temp files
 *.aux.xml
 *.ovr

@@ -30,7 +30,7 @@ flowchart TD
     %% ── Model training ────────────────────────────────────────
     subgraph ML ["Model Training"]
         PAIR  --> SPLIT["Train / test split  80 / 20\nFeature normalisation where required"]
-        SPLIT --> MODEL["Supervised Regression Model\nLinear Regression · Random Forest\nXGBoost · MLP"]
+        SPLIT --> MODEL["Supervised Regression Model\nLinear Regression · Decision Tree\nRandom Forest · XGBoost · MLP"]
         MODEL --> EVAL["Evaluation\nR²  RMSE  rRMSE  MAE  Bias"]
     end
 
@@ -128,8 +128,9 @@ python main.py
 
 
 This runs the full pipeline:
-- downloads and preprocesses data
-- generates predictor variables
-- trains machine learning models
+- downloads and preprocesses data (WaPOR L1, L3, Landsat 8/9)
+- generates six spectral/thermal predictor variables at 30 m
+- trains five models: Linear Regression, Decision Tree, Random Forest, XGBoost, MLP
+- produces downscaled ETa GeoTIFFs at 30 m and validates against WaPOR L3
 
 ---
